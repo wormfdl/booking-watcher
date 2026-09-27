@@ -1,21 +1,28 @@
 # -*- coding: utf-8 -*-
 """
-대추밭백한의원 취소표 감시기 - 경량 API 버전 (v3)
+대추밭백한의원 취소표 감시기 - 경량 API 버전 (v4)
 - Playwright/Chrome 불필요 (파이썬 표준 라이브러리만 사용)
 
-v3에서 바꾼 것 (중요):
-  이전 버전은 "시간대별 정원/예약수"를 직접 비교해서 빈자리를 판단했는데,
-  이 값이 실제 "예약 탭 노출 여부"와 일치하지 않는다는 게 확인되었습니다.
+v4에서 바꾼 것 (중요):
+  v3는 bizItems.bookingAvailableValue를 "마스터 스위치"로 보고 그 값이
+  바뀔 때만 알림을 보냈습니다. 그런데 실제로 확인해보니 이 값(그리고
+  business 쿼리의 bookingAvailableCode/Value 도 마찬가지)은 예약 탭이
+  사라졌다 다시 나타나는 동안에도 전혀 바뀌지 않았습니다. 즉 이 필드들은
+  실제 "취소표 발생"과 무관한 값이었습니다.
 
-  네이버 예약 페이지에 있는 진짜 마스터 스위치는 bizItems 쿼리의
-  `bookingAvailableValue` 값으로 보입니다. 이 값이 0일 때 실제로
-  네이버 지도의 "예약" 탭이 사라진 상태였고, 이 값이 바뀌면 예약 탭이
-  뜨는 것으로 추정됩니다 (병원 공지: "취소표가 있으면 실시간으로
-  예약창이 오픈됩니다"와 정확히 일치).
+  그래서 v4는 더 이상 이런 "상태값"에 의존하지 않습니다. 대신 시간대별
+  (hourlySchedule) 정원(unitStock)-예약(unitBookingCount) 값을 5분마다
+  스냅샷으로 저장해두고, 바로 다음 스냅샷과 비교해서 "특정 시간대의
+  빈자리 수가 이전보다 늘어났는지"만 봅니다.
 
-  그래서 이제부터는 이 값(그리고 isClosedBooking, bookableSettingJson)의
-  '변화'만 감시하고, 변화가 감지되면 시간대별 상세 정보는 참고용으로만
-  같이 보여줍니다.
+  - 빈자리가 늘었다 = 누군가 취소했거나(취소표 발생), 새 날짜가
+    예약 오픈됐다(예: 12월 예약 10/25 13시 오픈) 는 뜻이므로 100% 실제
+    변화입니다. "마감"이라는 라벨이 무엇을 의미하는지 몰라도 상관없이,
+    숫자가 늘어나는 순간 자체는 거짓일 수 없습니다.
+  - 반대로 원래도 비어있던 자리가 계속 비어있는 건(=이전과 값이 같음)
+    알림을 보내지 않습니다. → v1에서 있었던 "이미 있던 자리를 전부
+    새 자리로 착각해서 우르르 알림 보내는" 문제가 구조적으로 없습니다.
+  - 첫 실행(state.json 없음)은 항상 기준선만 저장하고 알림 없음.
 """
 import json
 import os
@@ -28,24 +35,11 @@ BIZ_ITEM_ID = "6566444"
 BUSINESS_TYPE_ID = 13
 PLACE_ID = "13258169"
 
-MONITOR_DAYS = 100  # 참고용 시간대 상세 조회 범위
+MONITOR_DAYS = 100  # 오늘부터 몇일치 시간대를 감시할지 (12월 오픈까지 커버)
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
 
 GRAPHQL_URL = "https://m.booking.naver.com/graphql"
-
-BIZITEMS_QUERY = """query bizItems($input: BizItemsParams) {
-  bizItems(input: $input) {
-    id
-    bizItemId
-    isClosedBooking
-    isClosedBookingUser
-    bookingAvailableCode
-    bookingAvailableValue
-    bookableSettingJson
-    __typename
-  }
-}"""
 
 SCHEDULE_QUERY = """query hourlySchedule($scheduleParams: ScheduleParams) {
   schedule(input: $scheduleParams) {
@@ -94,28 +88,8 @@ def call_graphql(query, variables, op_name):
     return parsed["data"]
 
 
-def fetch_master_status():
-    data = call_graphql(
-        BIZITEMS_QUERY,
-        {"input": {"businessId": BUSINESS_ID, "lang": "ko", "projections": "RESOURCE"}},
-        "bizItems",
-    )
-    items = data.get("bizItems") or []
-    if not items:
-        raise RuntimeError("bizItems 응답이 비어있습니다")
-    item = items[0]
-    return {
-        "isClosedBooking": item.get("isClosedBooking"),
-        "isClosedBookingUser": item.get("isClosedBookingUser"),
-        "bookingAvailableCode": item.get("bookingAvailableCode"),
-        "bookingAvailableValue": item.get("bookingAvailableValue"),
-        "isPaused": (item.get("bookableSettingJson") or {}).get("isPaused"),
-        "isOpened": (item.get("bookableSettingJson") or {}).get("isOpened"),
-    }
-
-
-def fetch_detail_hint(now: datetime):
-    """참고용: 지금 시간대별로 정원보다 예약이 적은 곳이 있는지 (확정 정보는 아님)"""
+def fetch_slots(now: datetime):
+    """시간대별 (정원 - 예약) 스냅샷을 딕셔너리로 반환: {slot_key: 빈자리수}"""
     today = datetime.now().date()
     start = today.strftime("%Y-%m-%d")
     end = (today + timedelta(days=MONITOR_DAYS)).strftime("%Y-%m-%d")
@@ -135,12 +109,11 @@ def fetch_detail_hint(now: datetime):
         "hourlySchedule",
     )
     hourly = data["schedule"]["bizItemSchedule"]["hourly"]
-    hints = []
+
+    slots = {}
+    meta = {}
     for h in hourly:
         if not h.get("isUnitBusinessDay") or not h.get("isUnitSaleDay"):
-            continue
-        stock, booked = h.get("unitStock"), h.get("unitBookingCount")
-        if stock is None or booked is None or booked >= stock:
             continue
         start_dt_str = h.get("unitStartDateTime")
         if start_dt_str:
@@ -149,8 +122,19 @@ def fetch_detail_hint(now: datetime):
                     continue
             except ValueError:
                 pass
-        hints.append(f"{h['unitStartTime']} (정원 {stock}/예약 {booked})")
-    return hints
+        stock, booked = h.get("unitStock"), h.get("unitBookingCount")
+        if stock is None or booked is None:
+            continue
+        key = f"{h.get('id')}|{start_dt_str}"
+        available = max(0, stock - booked)
+        slots[key] = available
+        meta[key] = {
+            "date": start_dt_str,
+            "time": h.get("unitStartTime"),
+            "stock": stock,
+            "booked": booked,
+        }
+    return slots, meta
 
 
 def send_telegram(text: str):
@@ -171,72 +155,66 @@ def send_telegram(text: str):
         print(f"[알림 전송 실패] {e}")
 
 
-def load_previous_status():
+def load_previous_slots():
     if not os.path.exists(STATE_FILE):
         return None
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        # 이전 버전(v1/v2) 형식이면 호환되지 않으므로 첫 실행으로 취급
-        if not isinstance(data, dict) or "bookingAvailableValue" not in data:
+        # v1/v2/v3 형식이면 호환되지 않으므로 첫 실행으로 취급
+        if not isinstance(data, dict) or "slots" not in data or not isinstance(data["slots"], dict):
             return None
-        return data
+        return data["slots"]
     except Exception:
         return None
 
 
-def save_status(status):
+def save_slots(slots):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(status, f, ensure_ascii=False, indent=2)
+        json.dump({"slots": slots, "updated": datetime.now().isoformat()}, f, ensure_ascii=False, indent=2)
 
 
 def main():
     now = datetime.utcnow()
-    status = fetch_master_status()
-    print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] 현재 상태: {status}")
+    slots, meta = fetch_slots(now)
+    print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] 감시 대상 시간대 {len(slots)}개 조회 완료")
 
-    previous = load_previous_status()
+    previous = load_previous_slots()
 
     if previous is None:
-        print("첫 실행입니다. 현재 상태를 기준선으로만 저장하고, 알림은 보내지 않습니다.")
-        save_status(status)
+        print("첫 실행(또는 이전 버전 상태파일)입니다. 현재 상태를 기준선으로만 저장하고, 알림은 보내지 않습니다.")
+        save_slots(slots)
         return
 
-    changed = (
-        previous.get("bookingAvailableValue") != status.get("bookingAvailableValue")
-        or previous.get("bookingAvailableCode") != status.get("bookingAvailableCode")
-        or previous.get("isClosedBooking") != status.get("isClosedBooking")
-        or previous.get("isPaused") != status.get("isPaused")
-    )
+    increased = []
+    for key, available in slots.items():
+        prev_available = previous.get(key, 0)
+        if available > prev_available:
+            increased.append((key, prev_available, available))
 
-    if changed:
-        print("변화 감지! 이전:", previous, "/ 지금:", status)
-        try:
-            hints = fetch_detail_hint(now)
-        except Exception as e:
-            hints = []
-            print(f"상세 정보 조회 실패(무시): {e}")
-
+    if increased:
+        print(f"빈자리 증가 감지! {len(increased)}건")
+        increased.sort(key=lambda x: meta[x[0]]["date"] or "")
         lines = [
-            "🦷 대추밭백한의원 예약 상태 변화 감지!",
+            "🦷 대추밭백한의원 취소표(빈자리) 발생!",
             "",
-            f"이전: bookingAvailableValue={previous.get('bookingAvailableValue')}, code={previous.get('bookingAvailableCode')}",
-            f"지금: bookingAvailableValue={status.get('bookingAvailableValue')}, code={status.get('bookingAvailableCode')}",
-            "",
-            "네이버 지도에서 '예약' 탭이 떴는지 직접 확인하세요:",
-            f"https://pcmap.place.naver.com/hospital/{PLACE_ID}/home",
         ]
-        if hints:
-            lines.append("")
-            lines.append("참고로 정원보다 예약이 적은 시간대(확정 정보 아님):")
-            for h in hints[:15]:
-                lines.append(f"- {h}")
-
+        for key, prev_a, now_a in increased[:15]:
+            m = meta[key]
+            date_str = (m["date"] or "").replace("T", " ").replace("Z", "")
+            lines.append(
+                f"- {date_str} {m['time']}  (정원 {m['stock']} / 예약 {m['booked']}, 빈자리 {prev_a}→{now_a})"
+            )
+        if len(increased) > 15:
+            lines.append(f"...외 {len(increased) - 15}건 더")
+        lines.append("")
+        lines.append("아래 링크에서 바로 예약을 확인/진행하세요:")
+        lines.append(f"https://m.booking.naver.com/booking/13/bizes/{BUSINESS_ID}/items/{BIZ_ITEM_ID}")
         send_telegram("\n".join(lines))
     else:
         print("변화 없음 (알림 안 보냄)")
 
-    save_status(status)
+    save_slots(slots)
 
 
 if __name__ == "__main__":
