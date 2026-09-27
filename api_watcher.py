@@ -1,26 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-대추밭백한의원 취소표 감시기 - 경량 API 버전 (v6)
+대추밭백한의원 취소표 감시기 - 경량 API 버전 (v7)
 
-v6에서 바꾼 것:
-  v5는 "예약 탭이 진짜로 뜬 것"이 확인될 때만 알림을 보냈는데,
-  그 확인 신호(플레이스 페이지의 naverBooking 값)가 뜨기 *전에*
-  이미 시간대별 빈자리 숫자(hourlySchedule)가 먼저 바뀌는 경우가 있을 수
-  있습니다. 5분 주기 안에서는 1초라도 더 빨리 아는 게 유리할 수 있으므로,
-  두 신호를 다 알림으로 보내되 성격을 구분합니다.
-
-  - ⚡ 조기 신호(미확인): 시간대별 빈자리 수가 이전보다 늘어남을 감지.
-    과거에 실제로 틀렸던 적이 있는 신호라서 "아직 확정 아님"으로 표시합니다.
-  - ✅ 확인됨: 네이버 지도 플레이스 페이지의 naverBooking.bookingBusinessId /
-    naverBookingUrl 이 null → 값 있음으로 바뀌는 것을 확인. 이건 "예약" 탭이
-    실제로 화면에 뜨는 원본 데이터라서 신뢰도가 가장 높습니다.
-
-  같은 회차에 두 조건이 동시에 만족되면(탭도 열리고 숫자도 늘어난 경우)
-  혼란을 줄이기 위해 확인됨(✅) 알림만 보냅니다.
+v7에서 바꾼 것:
+  GitHub Actions의 스케줄(cron)은 5분보다 더 촘촘하게 새로 "시작"할 수는
+  없지만, 한 번 시작한 작업을 오래(최대 6시간) 실행하는 건 가능합니다.
+  그래서 이번엔 한 번 실행되면 내부에서 1분마다 반복 확인하도록 바꿨습니다.
+  워크플로 스케줄은 5시간마다 새로 시작하고, 그 안에서 계속 1분 간격으로
+  돌다가 시간이 다 되면 종료 -> 곧이어 다음 회차가 이어받는 방식입니다.
+  (감시 로직 자체(⚡ 조기 신호 / ✅ 확인됨)는 v6과 동일합니다.)
 """
 import json
 import os
 import re
+import time
 import urllib.request
 import urllib.error
 from datetime import datetime, timedelta
@@ -31,6 +24,10 @@ BUSINESS_TYPE_ID = 13
 PLACE_ID = "13258169"
 
 MONITOR_DAYS = 100  # 시간대별 조회 범위
+
+CHECK_INTERVAL_SECONDS = 60      # 반복 확인 간격
+LOOP_DURATION_MINUTES = int(os.environ.get("LOOP_MINUTES", "340"))  # 한 번 실행되면 이 시간(분)만큼 반복 후 종료
+STATE_SAVE_EVERY_N_CHECKS = 10   # 몇 번 확인마다 디스크에 안전 저장할지
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
 
@@ -215,7 +212,8 @@ def save_state(tab_open, slots):
         )
 
 
-def main():
+def run_one_check(prev_tab_open, prev_slots):
+    """한 번 확인하고, (알림 필요시 전송) 새 상태를 반환한다."""
     now = datetime.utcnow()
 
     try:
@@ -223,7 +221,6 @@ def main():
         tab_open_now = tab_status["tab_open"]
     except Exception as e:
         print(f"[탭 상태 확인 실패] {e}")
-        tab_status = None
         tab_open_now = None
 
     try:
@@ -233,24 +230,11 @@ def main():
         slots_now, meta = None, None
 
     if tab_open_now is None and slots_now is None:
-        print("이번 회차는 두 조회가 모두 실패해서 건너뜁니다.")
-        return
+        print("이번 확인은 두 조회가 모두 실패해서 건너뜁니다.")
+        return prev_tab_open, prev_slots
 
     print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] tab_open={tab_open_now}, "
           f"조회된 시간대 수={len(slots_now) if slots_now is not None else 'N/A'}")
-
-    previous = load_previous_state()
-
-    if previous is None:
-        print("첫 실행(또는 이전 버전 상태파일)입니다. 현재 상태를 기준선으로만 저장하고, 알림은 보내지 않습니다.")
-        save_state(
-            tab_open_now if tab_open_now is not None else False,
-            slots_now if slots_now is not None else {},
-        )
-        return
-
-    prev_tab_open = previous.get("tab_open", False)
-    prev_slots = previous.get("slots", {})
 
     confirmed = (tab_open_now is True) and (prev_tab_open is False)
 
@@ -295,10 +279,46 @@ def main():
     else:
         print("변화 없음 (알림 안 보냄)")
 
-    save_state(
-        tab_open_now if tab_open_now is not None else prev_tab_open,
-        slots_now if slots_now is not None else prev_slots,
-    )
+    new_tab_open = tab_open_now if tab_open_now is not None else prev_tab_open
+    new_slots = slots_now if slots_now is not None else prev_slots
+    return new_tab_open, new_slots
+
+
+def main():
+    state = load_previous_state()
+
+    if state is None:
+        print("첫 실행(또는 이전 버전 상태파일)입니다. 첫 확인 결과를 기준선으로만 저장하고, 알림은 보내지 않습니다.")
+        try:
+            tab_status = fetch_tab_status()
+            tab_open = tab_status["tab_open"]
+        except Exception as e:
+            print(f"[탭 상태 확인 실패] {e}")
+            tab_open = False
+        try:
+            slots, _ = fetch_slots(datetime.utcnow())
+        except Exception as e:
+            print(f"[시간대 조회 실패] {e}")
+            slots = {}
+        save_state(tab_open, slots)
+        prev_tab_open, prev_slots = tab_open, slots
+    else:
+        prev_tab_open = state.get("tab_open", False)
+        prev_slots = state.get("slots", {})
+
+    start = time.monotonic()
+    checks = 0
+    deadline = LOOP_DURATION_MINUTES * 60
+
+    while time.monotonic() - start < deadline:
+        time.sleep(CHECK_INTERVAL_SECONDS)
+        prev_tab_open, prev_slots = run_one_check(prev_tab_open, prev_slots)
+        checks += 1
+        if checks % STATE_SAVE_EVERY_N_CHECKS == 0:
+            save_state(prev_tab_open, prev_slots)
+
+    save_state(prev_tab_open, prev_slots)
+    print(f"이번 회차 종료 (총 {checks}회 확인). 다음 회차가 이어받습니다.")
 
 
 if __name__ == "__main__":
