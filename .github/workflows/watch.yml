@@ -20,14 +20,23 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python3 api_watcher.py
 
-      - name: 상태 파일 저장 (변경된 경우만)
+      - name: 상태 파일 저장 (변경된 경우만, 충돌 시 재시도)
         run: |
-          if ! git diff --quiet state.json; then
-            git config user.name "watcher-bot"
-            git config user.email "watcher-bot@users.noreply.github.com"
-            git add state.json
-            git commit -m "update state"
-            git push
-          else
+          if git diff --quiet state.json; then
             echo "state.json 변경 없음, 커밋 생략"
+            exit 0
           fi
+          git config user.name "watcher-bot"
+          git config user.email "watcher-bot@users.noreply.github.com"
+          git add state.json
+          git commit -m "update state"
+          for i in 1 2 3 4 5; do
+            git fetch origin main
+            if git rebase origin/main && git push; then
+              exit 0
+            fi
+            git rebase --abort || true
+            sleep 3
+          done
+          echo "state.json 저장은 실패했지만 감시 자체는 정상 완료된 것으로 처리합니다"
+          exit 0
