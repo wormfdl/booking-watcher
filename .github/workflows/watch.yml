@@ -1,0 +1,33 @@
+name: 취소표 감시
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 취소표 확인
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python3 api_watcher.py
+
+      - name: 상태 파일 저장 (변경된 경우만)
+        run: |
+          if ! git diff --quiet state.json; then
+            git config user.name "watcher-bot"
+            git config user.email "watcher-bot@users.noreply.github.com"
+            git add state.json
+            git commit -m "update state"
+            git push
+          else
+            echo "state.json 변경 없음, 커밋 생략"
+          fi
