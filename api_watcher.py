@@ -1,11 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-대추밭백한의원 취소표 감시기 - 경량 API 버전
+대추밭백한의원 취소표 감시기 - 경량 API 버전 (v2)
 - Playwright/Chrome 불필요 (파이썬 표준 라이브러리만 사용)
 - GitHub Actions 등에서 몇 분 간격으로 실행되는 것을 전제로 설계됨
-  (한 번 실행 -> 확인 -> 필요하면 텔레그램 알림 -> 종료. 반복 실행은 스케줄러가 담당)
-- 이전 실행에서 확인했던 "빈자리 목록"을 state.json에 저장해두고,
-  이번 실행에서 "새로 생긴 빈자리"만 골라서 알림을 보냄 (중복 알림 방지)
+
+v2에서 고친 것:
+  1. 첫 실행(state.json이 아직 없을 때)에는 "원래 있던 빈자리"까지 전부
+     알림으로 보내던 오탐 버그 수정 -> 첫 실행은 조용히 기준선만 저장
+  2. 이미 지나간 시간(오늘 중 지난 시각)은 후보에서 제외
+  3. 알림 링크에 정확한 날짜(startDate)를 넣어서 클릭하면 바로 그 날짜로 이동
 """
 import json
 import os
@@ -13,16 +16,12 @@ import urllib.request
 import urllib.error
 from datetime import datetime, timedelta
 
-# ── 감시 대상 (네이버 예약) ──────────────────────────────────────────
 BUSINESS_ID = "1359557"
 BIZ_ITEM_ID = "6566444"
 BUSINESS_TYPE_ID = 13
-
-# 오늘부터 며칠 뒤까지 감시할지 (100일 = 약 3개월 후까지, 10/11/12월 전부 포함)
 MONITOR_DAYS = 100
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
-
 GRAPHQL_URL = "https://m.booking.naver.com/graphql?opName=hourlySchedule"
 
 QUERY = """query hourlySchedule($scheduleParams: ScheduleParams) {
@@ -30,6 +29,7 @@ QUERY = """query hourlySchedule($scheduleParams: ScheduleParams) {
     bizItemSchedule {
       hourly {
         id
+        unitStartDateTime
         unitStartTime
         unitBookingCount
         unitStock
@@ -85,8 +85,7 @@ def fetch_schedule(start_date: str, end_date: str):
     return parsed["data"]["schedule"]["bizItemSchedule"]["hourly"]
 
 
-def find_available(hourly):
-    """예약 가능(빈자리)한 슬롯만 골라서 {id: 표시용텍스트} 형태로 반환"""
+def find_available(hourly, now: datetime):
     result = {}
     for h in hourly:
         if not h.get("isUnitBusinessDay"):
@@ -97,8 +96,21 @@ def find_available(hourly):
         booked = h.get("unitBookingCount")
         if stock is None or booked is None:
             continue
-        if booked < stock:
-            result[h["id"]] = f"{h['unitStartTime']} (정원 {stock} / 예약 {booked})"
+        if booked >= stock:
+            continue
+
+        start_dt_str = h.get("unitStartDateTime")
+        if start_dt_str:
+            try:
+                start_dt = datetime.strptime(start_dt_str, "%Y-%m-%dT%H:%M:%SZ")
+                if start_dt <= now:
+                    continue
+            except ValueError:
+                pass
+
+        local_str = h["unitStartTime"]
+        date_part = local_str[:10]
+        result[h["id"]] = (f"{local_str} (정원 {stock} / 예약 {booked})", date_part)
     return result
 
 
@@ -122,20 +134,24 @@ def send_telegram(text: str):
 
 def load_previous_ids():
     if not os.path.exists(STATE_FILE):
-        return set()
+        return set(), True
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return set(json.load(f))
+            raw = json.load(f)
+        if isinstance(raw, list):
+            return set(raw), False
+        return set(raw.get("ids", [])), False
     except Exception:
-        return set()
+        return set(), True
 
 
 def save_current_ids(ids):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(sorted(ids), f, ensure_ascii=False, indent=2)
+        json.dump({"ids": sorted(ids)}, f, ensure_ascii=False, indent=2)
 
 
 def main():
+    now = datetime.utcnow()
     today = datetime.now().date()
     start = today.strftime("%Y-%m-%d")
     end = (today + timedelta(days=MONITOR_DAYS)).strftime("%Y-%m-%d")
@@ -143,23 +159,26 @@ def main():
     print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] 확인 범위: {start} ~ {end}")
 
     hourly = fetch_schedule(start, end)
-    available = find_available(hourly)
+    available = find_available(hourly, now)
     current_ids = set(available.keys())
 
-    previous_ids = load_previous_ids()
-    new_ids = current_ids - previous_ids
+    previous_ids, is_first_run = load_previous_ids()
 
+    if is_first_run:
+        print(f"첫 실행입니다. 현재 빈자리 {len(current_ids)}개를 기준선으로만 저장하고, 알림은 보내지 않습니다.")
+        save_current_ids(current_ids)
+        return
+
+    new_ids = current_ids - previous_ids
     print(f"현재 빈자리: {len(current_ids)}개 / 이전 대비 새로 생긴 빈자리: {len(new_ids)}개")
 
     if new_ids:
         lines = ["🦷 대추밭백한의원 취소표 발생!", ""]
-        for _id in sorted(new_ids, key=lambda i: available[i]):
-            lines.append("- " + available[_id])
-        lines.append("")
-        lines.append("네이버 예약 페이지에서 바로 확인하세요:")
-        lines.append(
-            f"https://m.booking.naver.com/booking/13/bizes/{BUSINESS_ID}/items/{BIZ_ITEM_ID}"
-        )
+        for _id in sorted(new_ids, key=lambda i: available[i][0]):
+            text, date_part = available[_id]
+            lines.append(
+                f"- {text}\n  https://m.booking.naver.com/booking/13/bizes/{BUSINESS_ID}/items/{BIZ_ITEM_ID}?startDate={date_part}"
+            )
         send_telegram("\n".join(lines))
     else:
         print("새로운 빈자리 없음 (알림 안 보냄)")
