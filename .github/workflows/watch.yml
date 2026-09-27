@@ -2,8 +2,13 @@ name: 취소표 감시
 
 on:
   schedule:
-    - cron: '*/5 * * * *'
+    - cron: '0 */5 * * *'
   workflow_dispatch:
+    inputs:
+      quick_test:
+        description: '빠른 테스트 (체크박스 켜면 3분만 돌고 종료)'
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -11,16 +16,19 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 355
     steps:
       - uses: actions/checkout@v4
 
-      - name: 취소표 확인
+      - name: 취소표 확인 (1분 간격으로 반복)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          LOOP_MINUTES: ${{ github.event.inputs.quick_test == 'true' && '3' || '340' }}
         run: python3 api_watcher.py
 
       - name: 상태 파일 저장 (변경된 경우만, 충돌 시 재시도)
+        if: always()
         run: |
           if git diff --quiet state.json; then
             echo "state.json 변경 없음, 커밋 생략"
