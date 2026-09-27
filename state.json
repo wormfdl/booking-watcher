@@ -1,8 +1,8 @@
 {
-  "ids": [
-    "6566444_null_null_2026-09-29T13:30:00+09:00",
-    "6566444_null_null_2026-10-13T10:30:00+09:00",
-    "6566444_null_null_2026-10-29T10:30:00+09:00",
-    "6566444_null_null_2026-11-16T15:00:00+09:00"
-  ]
+  "isClosedBooking": false,
+  "isClosedBookingUser": false,
+  "bookingAvailableCode": "RI01",
+  "bookingAvailableValue": 0,
+  "isPaused": false,
+  "isOpened": true
 }
